@@ -102,7 +102,7 @@ if "nframes" in ele:
 
 ## Usage
 
-TGV-KV is activated via the environment variable `KV_CACHE_TYPE=tgv_kv`. The retention ratio is controlled by `PRUNE_RATIO` (e.g., `0.05` for 5% retention).
+TGV-KV is activated via the environment variable `KV_CACHE_TYPE=tgv_kv`. The retention ratio is controlled by `PRUNE_RATIO` (e.g., `0.95` for 5% retention).
 
 ### Quick Start
 
