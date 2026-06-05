@@ -5,7 +5,7 @@
 </p>
 
 ![Conference](https://img.shields.io/badge/ICML-2026-blue)
-![Paper](https://img.shields.io/badge/Arxiv-coming_soon-red)
+[![Paper](https://img.shields.io/badge/Arxiv-2606.03075-red)](https://arxiv.org/abs/2606.03075)
 ![transformers](https://img.shields.io/badge/🤗-transformers_4.57-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
