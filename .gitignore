@@ -1,0 +1,23 @@
+# Virtual Environments & Secrets
+.env
+venv/
+env/
+.conda/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Machine Learning Weights & Large Data
+*.pt
+*.pth
+*.bin
+*.safetensors
+logs/
+models/
+
+# HPC / Cluster Logs
+slurm-*.out

@@ -1,0 +1,38 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug lmms_eval with Accelerate",
+            "type": "python",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MODEL_TYPE": "qwen-4B",
+                "MAX_GENERATED_TOKENS": "32",
+                "KV_CACHE_TYPE": "tgv_kv",
+                "PRUNE_RATIO": "0.95"
+            },
+            "args": [
+                "--num_processes=4",
+                "-m",
+                "lmms_eval",
+                "--model",
+                "qwen3_vl",
+                "--model_args",
+                "pretrained=Qwen/Qwen3-VL-4B-Instruct,attn_implementation=eager,device_map=cuda",
+                "--tasks",
+                "chartqa",
+                "--batch_size",
+                "1",
+                "--log_samples",
+                "--output_path",
+                "./logs/",
+                // "--limit",
+                // "50"
+            ]
+        }
+    ]
+}

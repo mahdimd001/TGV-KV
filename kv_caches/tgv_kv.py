@@ -28,7 +28,7 @@ class TGVKVCache:
         self.image_token_id = image_token_id
 
         self.ratio = ratio
-
+    # 1
     def begin_online_prefill(self, input_ids):
         if input_ids is None:
             return False
@@ -50,6 +50,109 @@ class TGVKVCache:
         }
         return True
 
+    def _similarity(self, A, sim_source, image_feats, grid_shape, spatial_mix, eps):
+        """Pairwise cosine similarity among image tokens, mapped to [0,1]. [N,N]."""
+        N = A.shape[1]
+        parts = []
+        if "attn" in sim_source:
+            D = A.t()                                # [N, T] attention profile per image token
+            D = D / D.norm(dim=1, keepdim=True).clamp_min(eps)
+            parts.append((D @ D.t()).clamp(0, 1))
+        if "feat" in sim_source:
+            assert image_feats is not None, "pass image_feats for sim_source containing 'feat'"
+            Df = image_feats.float()
+            Df = Df / Df.norm(dim=1, keepdim=True).clamp_min(eps)
+            parts.append(((Df @ Df.t()) * 0.5 + 0.5).clamp(0, 1))    # cosine [-1,1] -> [0,1]
+        if "spatial" in sim_source:
+            R, C = grid_shape
+            idx = torch.arange(N, device=A.device)
+            rc = torch.stack([idx // C, idx % C], dim=1).float()
+            d = torch.cdist(rc, rc)
+            sig = (R + C) / 4.0
+            parts.append(torch.exp(-(d ** 2) / (2 * sig ** 2)))
+    
+        if not parts:
+            raise ValueError(f"bad sim_source={sim_source!r}")
+        if len(parts) == 1:
+            return parts[0]
+        return (1 - spatial_mix) * parts[0] + spatial_mix * parts[-1]
+
+
+
+    @torch.no_grad()
+    def image_token_scores(self,
+        cross_attn: torch.Tensor,          # [T, N] already text-weighted
+        beta: float = 1.0,                 # diversity strength: 0 = plain sum(0), higher = more suppression
+        mode: str = "density",            # "soft_nms" (keeps representatives) | "density"
+        sim_source: str = "attn",          # "attn" | "feat" | "spatial" | "attn+spatial" | "feat+spatial"
+        image_feats: torch.Tensor | None = None,   # [N, D] for sim_source containing "feat"
+        grid_shape: tuple[int, int] = (24, 24),
+        spatial_mix: float = 0.5,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        A = cross_attn.float()                       # fp16 in -> fp32 for stable argmax/exp
+        T, N = A.shape
+    
+        importance = A.sum(0)                        # [N] the current (baseline) score
+    
+        if beta == 0:
+            return importance
+    
+        sim = self._similarity(A, sim_source, image_feats, grid_shape, spatial_mix, eps)  # [N,N] in [0,1]
+        sim.fill_diagonal_(0.0)
+    
+        if mode == "soft_nms":
+            more = importance[:, None] > importance[None, :]          # more[i,j]: i more important than j
+            supp = sim.masked_fill(~more, 0.0).max(dim=0).values      # [N] sim to closest more-important token
+            score = importance * (1.0 - supp).clamp(0.0, 1.0) ** beta
+        elif mode == "density":
+            # importance-weighted local density; representatives are penalized too (softer)
+            dens = sim @ importance                                   # [N]
+            dens = dens / dens.max().clamp_min(eps)
+            score = importance * torch.exp(-beta * dens)
+        else:
+            raise ValueError(mode)
+    
+        return score
+    
+ 
+    def med_norm(self,x):
+        eps = 1e-6
+        m = x.median()
+        return x / m.clamp_min(eps) if (m > 0) else x
+    
+    def text_vision_score(self,all_attn, image_start, visual_token_num, vis_score,
+                      window=16, pre_w=1.0, vis_w=1.0, post_w=1.5,
+                      bridge_w=0.5, protect=1e4):
+        """Return score_sum [1, S] where text & vision are on a comparable scale,
+        the +100 blanket is replaced by targeted protection."""
+        S = all_attn.shape[0]
+        text_start = image_start + visual_token_num
+        W = min(window, S)
+    
+        # observation window: last W query rows -> same queries score every token type
+        win = all_attn[S - W:, :]                       # [W, S]
+        prospective = win.sum(0)                         # [S]
+    
+        pre  = prospective[:image_start]                 # system prompt
+        post = prospective[text_start:]                  # question
+        vis  = vis_score.reshape(-1)                     # their diversity score
+    
+        score_pre  = pre_w  * self.med_norm(pre)
+        score_vis  = vis_w  * self.med_norm(vis)
+        score_post = post_w * self.med_norm(post)
+    
+        # cross-modal bridge: question tokens that pull on the image are load-bearing
+        ti = all_attn[text_start:, image_start:text_start].sum(1)   # [post_len]
+        score_post = score_post + bridge_w * self.med_norm(ti)
+    
+        # recency protection: last Wp question tokens are always kept
+        Wp = min(W, post.shape[0])
+        score_post[-Wp:] = score_post[-Wp:] + protect
+    
+        return torch.cat([score_pre, score_vis, score_post]).unsqueeze(0)
+    
+    # 2 for each layer
     def collect_online_prefill_attention(self, layer_idx, attention):
         stats = getattr(self, "_online_prefill_stats", None)
         if stats is None or attention is None:
@@ -62,16 +165,25 @@ class TGVKVCache:
         all_attn = attention.squeeze(0).mean(0)
         text_image_attns = all_attn[text_start:, image_start:text_start]
         text_text_attns = all_attn[text_start:, text_start:]
+        image_image_attns = all_attn[image_start : (image_start + visual_token_num), image_start : (image_start + visual_token_num)]
         text_text_score = text_text_attns.sum(0, keepdim=True)
         b = torch.arange(1, text_text_score.shape[-1] + 1).flip([0]).to(text_text_score.device).unsqueeze(0)
         text_text_score = text_text_score / b
         text_image_score = (text_image_attns * text_text_score.transpose(-1, -2)).sum(0, keepdim=True)
+
+        text_image_s = (text_image_attns * text_text_score.transpose(-1, -2))
+        res = self.image_token_scores(cross_attn=text_image_s,beta=1, sim_source="attn+spatial",spatial_mix=0.4)
+
+
         pre_score = all_attn[:, :image_start].sum(0, keepdim=True) + 100
         post_score = all_attn[:, image_start + visual_token_num :].sum(0, keepdim=True) + 100
 
-        stats["score_sums"][layer_idx] = torch.cat([pre_score, text_image_score, post_score], dim=1)
-        stats["text_image_attn_sums"][layer_idx] = text_image_attns.reshape(-1).sum()
+        #stats["score_sums"][layer_idx] = torch.cat([pre_score, text_image_score, post_score], dim=1)
+        #stats["score_sums"][layer_idx] = torch.cat([pre_score, res.unsqueeze(0), post_score], dim=1)
+        stats["score_sums"][layer_idx] = self.text_vision_score(all_attn, image_start, visual_token_num, vis_score=res)
 
+        stats["text_image_attn_sums"][layer_idx] = text_image_attns.reshape(-1).sum()
+    # 3
     def finish_online_prefill(self):
         stats = getattr(self, "_online_prefill_stats", None)
         if stats is None:
@@ -91,16 +203,16 @@ class TGVKVCache:
 
     def set_pending_attentions(self, attentions):
         self._pending_attentions = attentions
-
+    # 4
     def pop_pending_attentions(self):
         attentions = getattr(self, "_pending_attentions", None)
         if hasattr(self, "_pending_attentions"):
             del self._pending_attentions
         return attentions
-
+    # 6
     def _is_online_prefill_stats(self, attentions):
         return isinstance(attentions, dict) and attentions.get("tgv_kv_online_prefill", False)
-
+    # 5
     def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
         if past_key_values is None:
             return None
@@ -112,7 +224,7 @@ class TGVKVCache:
             self.initial_text_len_list = []
             return self._prefill(past_key_values, num_of_token, attentions, input_ids)
         return self._decode(past_key_values, num_of_token, attentions, input_ids)
-
+    # 8
     def _prefill(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
@@ -171,7 +283,7 @@ class TGVKVCache:
             past_key_values_return.append([k_select, v_select])
 
         return DynamicCache(past_key_values_return)
-
+    # 7
     def _prefill_from_online_stats(self, past_key_values, num_of_token=None, attentions=None):
         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
@@ -217,7 +329,7 @@ class TGVKVCache:
             past_key_values_return.append([k_select, v_select])
 
         return DynamicCache(past_key_values_return)
-
+    # 9
     def _decode(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
         seq_lens = np.array([p[0].size(self.k_seq_dim) for p in past_key_values])
         forget_nums = (seq_lens - num_of_token * (1 - self.ratios)).astype(np.int32)

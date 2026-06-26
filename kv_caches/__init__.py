@@ -2,6 +2,8 @@ import os
 
 from colorama import Fore, Style
 
+from .ricci_kv import RicciKVCache
+
 from .tgv_kv import TGVKVCache
 
 
@@ -25,8 +27,8 @@ def get_kv_cache(
         return None
     method = method.lower()
 
-    if method not in ("tgv_kv", "tgv-kv", "tgvkv"):
-        raise ValueError(f"Unsupported KV cache method: {method}. Only TGV-KV is available.")
+    if method not in ("tgv_kv", "tgv-kv", "tgvkv", "ricci_kv", "ricci-kv", "riccikv"):
+        raise ValueError(f"Unsupported KV cache method: {method}. Only TGV-KV and Ricci-KV are available.")
 
     model_type = os.environ.get("MODEL_TYPE", None)
     if model_type == "llava-7B":
@@ -61,4 +63,16 @@ def get_kv_cache(
             v_seq_dim=v_seq_dim,
             ratio=prune_ratio,
             layer_num=layer_num,
+        )
+    elif method in ("ricci_kv", "ricci-kv", "riccikv"):
+        return RicciKVCache(
+            layer_num=layer_num,
+            image_token_id=image_token_id,
+            start_size=start_size,
+            k_seq_dim=k_seq_dim,
+            v_seq_dim=v_seq_dim,
+            ratio=prune_ratio,
+            batch_size=1,
+            protect_size=16,
+            sparsification=1.0  # Pass custom params needed for graph building
         )

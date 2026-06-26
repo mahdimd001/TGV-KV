@@ -12,7 +12,7 @@ do
     echo ${KV_CACHE_TYPE}
     echo ${PRUNE_RATIO}
     accelerate launch --num_processes=2 --main_process_port 29508 -m lmms_eval --model llava_hf \
-        --model_args "pretrained=$ckpt,attn_implementation=eager,device_map=cuda" \
+        --model_args "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda" \
         --tasks "chartqa,textvqa_val,docvqa_val,vizwiz_vqa_val" --batch_size 1 --log_samples \
         --log_samples_suffix reproduce --output_path ./logs/
 done
