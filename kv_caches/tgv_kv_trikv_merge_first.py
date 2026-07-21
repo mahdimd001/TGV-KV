@@ -72,19 +72,19 @@ class TGVKVCache:
         v_seq_dim=2,
         ratio=0.0,
         batch_size=1,
-
-        merge_window=16,        # raster-order neighbor search radius
-        merge_threshold=0.0,  # max relative value distance to allow a merge
+        merge_window=8,        # raster-order neighbor search radius
+        merge_threshold=0.35,  # max relative value distance to allow a merge
         text_boost=1.0,        # damage multiplier for text KVs (soft TPR)
         last_query_boost=10.0,  # extra weight for the final text queries
         n_last_queries=4,
         amp_cap=50.0,          # ceiling on A/(1-A)
-        min_keep_per_layer=0,  # DWF tier-2 floor (on top of sinks + protect)
-        min_vision_keep=8,     # DWF tier-1 floor: vision reps per layer
+        min_keep_per_layer=8,  # DWF tier-2 floor (on top of sinks + protect)
+        min_vision_keep=4,     # DWF tier-1 floor: vision reps per layer
         decode_chunk=1,        # LCT: compress once we exceed target by this
         decode_decay=0.95,     # EMA decay of accumulated decode damage
         recent_window=8,       # newest tokens never evicted during decode
         fixed_budget=True,     # pin decode target to the prefill allocation
+        merge_first=True,      # consolidate duplicates BEFORE selection
         **kwargs,
     ):
         self.start_size = start_size
@@ -108,6 +108,7 @@ class TGVKVCache:
         self.decode_decay = decode_decay
         self.recent_window = recent_window
         self.fixed_budget = fixed_budget
+        self.merge_first = merge_first
         self._eps = 1e-4
 
         self.total_budget = 0
@@ -138,26 +139,18 @@ class TGVKVCache:
                 f"[TriKV] Warning ({phase}): total retained ({temp}) exceeds "
                 f"budget ({self.total_budget})."
             )
-            return False
-        return True
-    
-    @staticmethod
-    def _med_norm(x, eps=1e-6):
-        """Rescale a segment so its typical (median) token scores 1.0."""
-        if x.numel() == 0:
-            return x
-        m = x.median()
-        return x / m.clamp_min(eps) if (m > 0) else x
-    
+        return temp
+
     def _layer_damage(self, attn_text, values, image_start, text_start):
         """UDM for one layer.
 
         attn_text : [H, Nt, N] post-softmax rows of the text queries
         values    : [H_kv, N, d]
-        Returns (keep_cost [N], attn_mass [N], hm_values [N, d]) where
-        keep_cost is the normalised eviction damage (inf on hard-protected
-        slots), attn_mass is the query-weighted attention received, and
-        hm_values are head-mean value vectors used for merge pairing.
+        Returns (keep_cost [N], hm_values [N, d], o [H, Nt, d], o_scale)
+        where keep_cost is the normalised eviction damage (inf on
+        hard-protected slots), hm_values are head-mean value vectors used
+        for clustering / merge pairing, and (o, o_scale) are the text-query
+        blends and their mean norm, reused by cluster valuation.
         """
         H, Nt, N = attn_text.shape
         A = attn_text.float()
@@ -178,12 +171,8 @@ class TGVKVCache:
         damage = (w * amp * dist).sum(1).mean(0)                   # [N]
         # Relative perturbation: normalise by typical output magnitude so
         # damages are comparable ACROSS layers (required by DWF).
-        #uncomment this
         o_scale = o.norm(dim=-1).mean() + self._eps
         damage = damage / o_scale
-
-
-
 
         # Soft text priority.
         damage[:image_start] = damage[:image_start] * self.text_boost
@@ -192,9 +181,8 @@ class TGVKVCache:
         damage[: self.start_size] = float("inf")
         damage[N - self.protect_size :] = float("inf")
 
-        attn_mass = (w * A).sum(1).mean(0)                         # [N]
         hm_values = V.mean(0)                                      # [N, d]
-        return damage, attn_mass, hm_values
+        return damage, hm_values, o, o_scale
 
     def _best_kept_neighbor(self, hm_values, cand_abs, kept_mask, lo, hi):
         """For each candidate (absolute index), the most value-similar
@@ -222,6 +210,100 @@ class TGVKVCache:
             best_n = torch.where(upd, n_safe, best_n)
         rel = best_d / (v_c.norm(dim=-1) + self._eps)
         return rel, best_n
+
+    def _consolidate_vision(self, dmg, attn_text, values, hm, image_start, text_start, o, o_scale):
+        """Merge-first consolidation (runs BEFORE selection).
+
+        Chains raster-adjacent vision tokens whose head-mean values differ
+        by less than `merge_threshold` (relative) into clusters. Each
+        cluster is re-valued with its AGGREGATED counterfactual damage:
+
+            D_c = sum_i w_i * Ac/(1-Ac) * ||v_bar_c - o_i||,
+            Ac = sum_{j in c} A_ij,   v_bar_c = mean value of the cluster,
+
+        so a group of duplicates bids for a keep slot with its collective
+        importance instead of each member individually looking cheap
+        (the group-blindness of leave-one-out scoring). Members other than
+        the representative are barred from selection (-inf), so a cluster
+        can never occupy more than one budget slot.
+
+        Returns (adjusted_damage [N], info) where info carries the cluster
+        assignment for value fusion after selection, or (dmg, None) when
+        nothing clusters.
+        """
+        n_vis = text_start - image_start
+        if n_vis <= 1 or self.merge_threshold <= 0:
+            return dmg, None
+        device = dmg.device
+
+        hm_vis = hm[image_start:text_start].to(device)             # [n_vis, d]
+        # adjacent-pair chaining: token j joins its left neighbor's cluster
+        # if their values are near-identical (relative distance <= delta)
+        rel = (hm_vis[1:] - hm_vis[:-1]).norm(dim=-1) / (hm_vis[1:].norm(dim=-1) + self._eps)
+        new_cluster = torch.ones(n_vis, dtype=torch.bool, device=device)
+        new_cluster[1:] = rel > self.merge_threshold
+        cluster_id = torch.cumsum(new_cluster.long(), 0) - 1       # [n_vis]
+        C = int(cluster_id[-1].item()) + 1
+        sizes = torch.bincount(cluster_id, minlength=C).to(device) # [C]
+        if int((sizes > 1).sum().item()) == 0:
+            return dmg, None                                        # all singletons
+
+        # representative of each cluster = member with highest per-token
+        # damage (tie -> earliest), so the retained key sits on the most
+        # attended member and RoPE mismatch of the fused value is minimal.
+        idx = torch.arange(n_vis, device=device)
+        score = dmg[image_start:text_start].float() - idx.float() * 1e-9
+        max_s = torch.full((C,), float("-inf"), device=device)
+        max_s.scatter_reduce_(0, cluster_id, score, reduce="amax", include_self=True)
+        is_rep = score >= max_s[cluster_id]
+        rep_local = torch.zeros(C, dtype=torch.long, device=device)
+        rep_local[cluster_id[is_rep]] = idx[is_rep]
+        rep_pos = rep_local + image_start                           # [C] global
+
+        # aggregated cluster damage
+        A = attn_text.float().to(device)                            # [H, Nt, N]
+        H, Nt, _ = A.shape
+        Vh = self._repeat_kv(values, H).float().to(device)          # [H, N, d]
+        w = self._query_weights(Nt, device).view(1, Nt, 1)
+
+        A_v = A[:, :, image_start:text_start]                       # [H, Nt, n_vis]
+        A_c = torch.zeros(H, Nt, C, device=device)
+        A_c.index_add_(2, cluster_id, A_v)                          # summed attention
+        Vv = Vh[:, image_start:text_start, :]                       # [H, n_vis, d]
+        v_sum = torch.zeros(H, C, Vv.shape[-1], device=device)
+        v_sum.index_add_(1, cluster_id, Vv)
+        v_bar = v_sum / sizes.view(1, -1, 1).float()                # [H, C, d]
+
+        G = torch.bmm(o.to(device), v_bar.transpose(1, 2))          # [H, Nt, C]
+        v_sq = (v_bar * v_bar).sum(-1).unsqueeze(1)                 # [H, 1, C]
+        o_sq = (o.to(device) * o.to(device)).sum(-1).unsqueeze(-1)  # [H, Nt, 1]
+        dist = (v_sq + o_sq - 2.0 * G).clamp_min(0).sqrt()
+        amp = A_c / (1.0 - A_c).clamp_min(self._eps)
+        if self.amp_cap is not None:
+            amp = amp.clamp_max(self.amp_cap)
+        dmg_c = (w * amp * dist).sum(1).mean(0) / o_scale           # [C]
+
+        adjusted = dmg.clone()
+        adjusted[image_start:text_start] = float("-inf")            # members barred
+        adjusted[rep_pos] = dmg_c.to(adjusted.dtype)                # reps carry cluster value
+
+        info = {"cluster_id": cluster_id, "rep_pos": rep_pos,
+                "sizes": sizes, "image_start": image_start}
+        return adjusted, info
+
+    def _cluster_merge_lists(self, info, kept_mask):
+        """After selection: members of KEPT clusters fuse into their
+        representative; members of dropped clusters are simply evicted."""
+        cluster_id, rep_pos = info["cluster_id"], info["rep_pos"]
+        image_start = info["image_start"]
+        device = kept_mask.device
+        vis_pos = torch.arange(cluster_id.numel(), device=device) + image_start
+        kept_rep = kept_mask[rep_pos.to(device)]                    # [C]
+        cid = cluster_id.to(device)
+        src_mask = kept_rep[cid] & (vis_pos != rep_pos.to(device)[cid])
+        merge_src = vis_pos[src_mask]
+        merge_tgt = rep_pos.to(device)[cid[src_mask]]
+        return merge_src, merge_tgt
 
     # ------------------------------------------------------------------ #
     # Online prefill hooks (layer-by-layer collection)                    #
@@ -411,16 +493,22 @@ class TGVKVCache:
             print("[TriKV] No KV to compress.")
             return past_key_values
 
-        # ---- UDM per layer ---------------------------------------------
-        damages, masses, hm_vals = [], [], []
+        # ---- UDM per layer (+ merge-first consolidation) -----------------
+        damages, hm_vals, cluster_infos = [], [], []
         for l in range(self.layer_num):
             v_cache = past_key_values[l][1].squeeze(0)              # [H_kv, N, d]
-            dmg, mass, hv = self._layer_damage(
-                text_rows[l].to(v_cache.device), v_cache, image_start, text_start
+            rows_l = text_rows[l].to(v_cache.device)
+            dmg, hv, o, o_scale = self._layer_damage(
+                rows_l, v_cache, image_start, text_start
             )
+            cinfo = None
+            if self.merge_first:
+                dmg, cinfo = self._consolidate_vision(
+                    dmg, rows_l, v_cache, hv, image_start, text_start, o, o_scale
+                )
             damages.append(dmg)
-            masses.append(mass)
             hm_vals.append(hv)
+            cluster_infos.append(cinfo)
 
         # ---- DWF with hard budget: tiered, budget-respecting floors ------
         device = damages[0].device
@@ -437,6 +525,9 @@ class TGVKVCache:
             ]
         )
         global_keep = torch.zeros(flat.numel(), dtype=torch.bool, device=device)
+        # never let top-k spill into -inf entries (barred cluster members /
+        # already-forced slots) when the budget exceeds the finite pool
+        remaining = min(remaining, int(torch.isfinite(flat).sum().item()))
         if remaining > 0:
             global_keep[torch.topk(flat, remaining).indices] = True
 
@@ -453,17 +544,24 @@ class TGVKVCache:
             kept_mask = forced_masks[l] | global_keep[offset : offset + N].to(dmg.device)
             offset += N
 
-            # NRM: below-threshold vision tokens choose merge vs evict.
-            cand_abs = ((~kept_mask).nonzero(as_tuple=True)[0])
-            cand_abs = cand_abs[(cand_abs >= image_start) & (cand_abs < text_start)]
+            # Merge lists.
+            # merge_first: members of KEPT clusters fuse into their
+            #              representative; dropped clusters are evicted whole.
+            # legacy:      below-threshold vision tokens seek a retained twin
+            #              AFTER selection (original NRM).
             merge_src = merge_tgt = None
-            if cand_abs.numel() > 0 and self.merge_threshold > 0:
-                rel, n_abs = self._best_kept_neighbor(
-                    hm_vals[l], cand_abs, kept_mask, image_start, text_start
-                )
-                ok = rel <= self.merge_threshold
-                merge_src = cand_abs[ok]
-                merge_tgt = n_abs[ok]
+            if cluster_infos[l] is not None:
+                merge_src, merge_tgt = self._cluster_merge_lists(cluster_infos[l], kept_mask)
+            elif not self.merge_first:
+                cand_abs = ((~kept_mask).nonzero(as_tuple=True)[0])
+                cand_abs = cand_abs[(cand_abs >= image_start) & (cand_abs < text_start)]
+                if cand_abs.numel() > 0 and self.merge_threshold > 0:
+                    rel, n_abs = self._best_kept_neighbor(
+                        hm_vals[l], cand_abs, kept_mask, image_start, text_start
+                    )
+                    ok = rel <= self.merge_threshold
+                    merge_src = cand_abs[ok]
+                    merge_tgt = n_abs[ok]
 
             kept_idx = kept_mask.nonzero(as_tuple=True)[0].sort().values
             k_cache = past_key_values[l][0].squeeze(0)              # [H_kv, N, d]
@@ -492,14 +590,7 @@ class TGVKVCache:
             self._prefill_kept[l] = kept_idx.numel()
             self._register_layer_decode_state(dmg, kept_idx, weights, image_start, text_start, N)
 
-            n_keep = int(kept_idx.numel())
-            n_merge = int(merge_src.numel()) if merge_src is not None else 0
-            n_evict = N - n_keep - n_merge
-            #print(f"[TriKV][prefill] layer {l:02d}: keep={n_keep}  merge={n_merge} evict={n_evict}  (N={N})")
-
-
-
-        check = self._check_budget(out, "prefill")
+        self._check_budget(out, "prefill")
         return DynamicCache(out)
 
     # ------------------------------------------------------------------ #
@@ -629,7 +720,5 @@ class TGVKVCache:
             self._protected[i] = protected[keep_idx]
             self._mass[i] = mass[keep_idx]
 
-        check = self._check_budget(out, "decode")
+        self._check_budget(out, "decode")
         return DynamicCache(out)
-
-

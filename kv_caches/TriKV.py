@@ -19,20 +19,11 @@ class TGVKVCache:
         perturbations that are comparable across layers.
 
     (2) DWF -- Damage Water-Filling. No per-layer budget policy. All L*N
-        keep-costs are pooled and a single global selection retains the most
+        keep-costs are pooled and a single global threshold retains the most
         expensive tokens until the total budget is spent. Layer budgets
         emerge from equalising marginal damage across layers (the KKT
-        condition of budgeted damage minimisation).
-
-        The budget is a HARD constraint: total retained <= total_budget,
-        always. Floors are tiered preferences granted in priority order
-        only while budget remains:
-          tier 0 (structural): sinks + final token  -- trimmed only if the
-                  budget is below the structural minimum (loud warning);
-          tier 1: min_vision_keep vision representatives per layer;
-          tier 2: min_keep_per_layer top-ups.
-        Tier-1/2 grants are filled globally by damage, so under tight
-        budgets the floors degrade gracefully instead of overshooting.
+        condition of budgeted damage minimisation). A small per-layer floor
+        prevents pathological emptying.
 
     (3) NRM -- Neighbor-Restricted Merging. A below-threshold vision token
         is merged into the most value-similar RETAINED token within a small
@@ -44,12 +35,11 @@ class TGVKVCache:
 
     (4) LCT -- Lazy Chunked Triage. During decode, per-token damage is
         accumulated with an EMA of the same counterfactual quantity. The
-        cache may drift `decode_chunk` tokens above its target, then is
-        compressed back in one batch (merge-or-evict). With
-        `fixed_budget=True` (default) the per-layer target is pinned to the
-        prefill allocation, so the total cache never exceeds total_budget
-        during generation; with `fixed_budget=False` the target grows
-        proportionally with generated length (TGV-KV-style).
+        cache may drift `decode_chunk` tokens above budget, then is
+        compressed back in one batch (merge-or-evict), amortising tensor
+        copies and denoising the eviction signal. Sinks, instruction text,
+        and the newest `recent_window` tokens are protected via explicit
+        masks pruned in sync with the cache.
 
     Text is not special-cased by a hard rule: its damage is naturally large,
     and `text_boost` multiplies it further, yielding TPR-like protection
@@ -72,19 +62,17 @@ class TGVKVCache:
         v_seq_dim=2,
         ratio=0.0,
         batch_size=1,
-
-        merge_window=16,        # raster-order neighbor search radius
-        merge_threshold=0.0,  # max relative value distance to allow a merge
-        text_boost=1.0,        # damage multiplier for text KVs (soft TPR)
-        last_query_boost=10.0,  # extra weight for the final text queries
+        merge_window=8,        # raster-order neighbor search radius
+        merge_threshold=0.35,  # max relative value distance to allow a merge
+        text_boost=1000.0,     # damage multiplier for text KVs (soft TPR)
+        last_query_boost=4.0,  # extra weight for the final text queries
         n_last_queries=4,
         amp_cap=50.0,          # ceiling on A/(1-A)
-        min_keep_per_layer=0,  # DWF tier-2 floor (on top of sinks + protect)
-        min_vision_keep=8,     # DWF tier-1 floor: vision reps per layer
-        decode_chunk=1,        # LCT: compress once we exceed target by this
+        min_keep_per_layer=16, # DWF floor (on top of sinks + protect)
+        min_vision_keep=8,     # vision representatives guaranteed per layer
+        decode_chunk=1,       # LCT: compress once we exceed budget by this
         decode_decay=0.95,     # EMA decay of accumulated decode damage
         recent_window=8,       # newest tokens never evicted during decode
-        fixed_budget=True,     # pin decode target to the prefill allocation
         **kwargs,
     ):
         self.start_size = start_size
@@ -107,7 +95,6 @@ class TGVKVCache:
         self.decode_chunk = decode_chunk
         self.decode_decay = decode_decay
         self.recent_window = recent_window
-        self.fixed_budget = fixed_budget
         self._eps = 1e-4
 
         self.total_budget = 0
@@ -129,26 +116,6 @@ class TGVKVCache:
             w[-n_last:] = self.last_query_boost
         return w / w.sum()
 
-    def _check_budget(self, out, phase):
-        temp = 0
-        for i in out:
-            temp += i[0].shape[-2]
-        if temp > self.total_budget:
-            print(
-                f"[TriKV] Warning ({phase}): total retained ({temp}) exceeds "
-                f"budget ({self.total_budget})."
-            )
-            return False
-        return True
-    
-    @staticmethod
-    def _med_norm(x, eps=1e-6):
-        """Rescale a segment so its typical (median) token scores 1.0."""
-        if x.numel() == 0:
-            return x
-        m = x.median()
-        return x / m.clamp_min(eps) if (m > 0) else x
-    
     def _layer_damage(self, attn_text, values, image_start, text_start):
         """UDM for one layer.
 
@@ -178,12 +145,8 @@ class TGVKVCache:
         damage = (w * amp * dist).sum(1).mean(0)                   # [N]
         # Relative perturbation: normalise by typical output magnitude so
         # damages are comparable ACROSS layers (required by DWF).
-        #uncomment this
         o_scale = o.norm(dim=-1).mean() + self._eps
         damage = damage / o_scale
-
-
-
 
         # Soft text priority.
         damage[:image_start] = damage[:image_start] * self.text_boost
@@ -226,6 +189,7 @@ class TGVKVCache:
     # ------------------------------------------------------------------ #
     # Online prefill hooks (layer-by-layer collection)                    #
     # ------------------------------------------------------------------ #
+    # 1
     def begin_online_prefill(self, input_ids):
         if input_ids is None:
             return False
@@ -240,7 +204,7 @@ class TGVKVCache:
             "text_attn_rows": [None] * self.layer_num,
         }
         return True
-
+    # 2 (per layer)
     def collect_online_prefill_attention(self, layer_idx, attention):
         stats = getattr(self, "_online_prefill_stats", None)
         if stats is None or attention is None:
@@ -249,7 +213,8 @@ class TGVKVCache:
         stats["text_attn_rows"][layer_idx] = (
             attention.squeeze(0)[:, text_start:, :].detach().half()
         )
-
+    
+    # 3
     def finish_online_prefill(self):
         stats = getattr(self, "_online_prefill_stats", None)
         if stats is None:
@@ -280,6 +245,7 @@ class TGVKVCache:
     # ------------------------------------------------------------------ #
     # Dispatch                                                            #
     # ------------------------------------------------------------------ #
+    # 4
     def __call__(self, past_key_values, num_of_token=None, attentions=None, input_ids=None):
         if past_key_values is None:
             return None
@@ -299,107 +265,9 @@ class TGVKVCache:
         return self._decode(past_key_values, num_of_token, attentions, input_ids)
 
     # ------------------------------------------------------------------ #
-    # Budget-respecting tiered floors                                     #
-    # ------------------------------------------------------------------ #
-    def _allocate_forced(self, damages, seq_lens, image_start, text_start, total_budget):
-        """Build per-layer forced-keep masks such that
-        sum(forced) <= total_budget ALWAYS.
-
-        Tier 0: sinks + final token (structural; trimmed only if the budget
-                is below the structural minimum, with a loud warning).
-        Tier 1: vision representatives (min_vision_keep per layer).
-        Tier 2: min_keep_per_layer top-ups.
-        Tiers 1 and 2 are granted globally by descending damage while
-        budget remains.
-
-        Returns (forced_masks, remaining) with
-        remaining = total_budget - sum(forced) >= 0.
-        """
-        L = self.layer_num
-        n_vis = text_start - image_start
-        structural_per_layer = self.start_size + self.protect_size
-        n_struct = structural_per_layer * L
-
-        # ---- pathological case: budget below the structural minimum -----
-        if n_struct > total_budget:
-            print(
-                f"[TriKV] Warning: budget ({total_budget}) is below the "
-                f"structural minimum ({n_struct} = (sinks+final) x layers). "
-                f"Trimming structural protections to fit; quality will be "
-                f"severely degraded. Increase the budget or reduce start_size."
-            )
-            quota = total_budget
-            forced_masks = []
-            for l in range(L):
-                N = seq_lens[l]
-                f = torch.zeros(N, dtype=torch.bool, device=damages[l].device)
-                slots = list(range(self.start_size)) + list(range(N - self.protect_size, N))
-                for s in slots[: max(quota, 0)]:
-                    f[s] = True
-                quota -= int(f.sum().item())
-                forced_masks.append(f)
-            return forced_masks, 0
-
-        # ---- tier 0 ------------------------------------------------------
-        forced_masks = []
-        tier1_lay, tier1_idx, tier1_dmg = [], [], []
-        tier2_lay, tier2_idx, tier2_dmg = [], [], []
-        for l in range(L):
-            dmg = damages[l]
-            N = seq_lens[l]
-            f = torch.zeros(N, dtype=torch.bool, device=dmg.device)
-            f[: self.start_size] = True
-            f[N - self.protect_size :] = True
-            forced_masks.append(f)
-
-            sel = f.clone()
-            # tier-1 candidates: top vision tokens by damage
-            if n_vis > 0 and self.min_vision_keep > 0:
-                nv = min(self.min_vision_keep, n_vis)
-                cand = torch.topk(dmg[image_start:text_start], nv).indices + image_start
-                tier1_lay.append(torch.full((nv,), l, dtype=torch.long))
-                tier1_idx.append(cand.cpu())
-                tier1_dmg.append(dmg[cand].detach().float().cpu())
-                sel[cand] = True
-            # tier-2 candidates: top-up to the per-layer minimum
-            min_floor = structural_per_layer + self.min_keep_per_layer
-            deficit = min_floor - int(sel.sum().item())
-            if deficit > 0:
-                d2 = dmg.clone()
-                d2[sel] = float("-inf")
-                cand2 = torch.topk(d2, deficit).indices
-                tier2_lay.append(torch.full((deficit,), l, dtype=torch.long))
-                tier2_idx.append(cand2.cpu())
-                tier2_dmg.append(dmg[cand2].detach().float().cpu())
-
-        remaining = total_budget - n_struct
-
-        # ---- grant tiers 1 then 2, globally by damage, within budget -----
-        for lays, idxs, dmgs_t in (
-            (tier1_lay, tier1_idx, tier1_dmg),
-            (tier2_lay, tier2_idx, tier2_dmg),
-        ):
-            if remaining <= 0 or len(lays) == 0:
-                continue
-            lay = torch.cat(lays)
-            idx = torch.cat(idxs)
-            dmg_t = torch.cat(dmgs_t)
-            take = min(int(dmg_t.numel()), remaining)
-            if take <= 0:
-                continue
-            granted = torch.topk(dmg_t, take).indices
-            g_lay, g_idx = lay[granted], idx[granted]
-            for l in range(L):
-                sel_l = g_idx[g_lay == l]
-                if sel_l.numel() > 0:
-                    forced_masks[l][sel_l.to(forced_masks[l].device)] = True
-            remaining -= take
-
-        return forced_masks, max(remaining, 0)
-
-    # ------------------------------------------------------------------ #
     # Prefill: UDM -> DWF -> NRM                                          #
     # ------------------------------------------------------------------ #
+    # 5
     def _prefill(self, past_key_values, num_of_token, text_rows, image_start, text_start):
         seq_lens = [p[0].size(self.k_seq_dim) for p in past_key_values]
         seq_len = seq_lens[0]
@@ -422,36 +290,42 @@ class TGVKVCache:
             masses.append(mass)
             hm_vals.append(hv)
 
-        # ---- DWF with hard budget: tiered, budget-respecting floors ------
-        device = damages[0].device
-        forced_masks, remaining = self._allocate_forced(
-            damages, seq_lens, image_start, text_start, total_budget
-        )
+        # ---- DWF: one global threshold over all layers ------------------
+        all_costs = torch.cat([d.to(damages[0].device) for d in damages])
+        n_inf = torch.isinf(all_costs).sum().item()
+        k = max(total_budget, n_inf)
+        k = min(k, all_costs.numel())
+        tau = torch.kthvalue(all_costs, all_costs.numel() - k + 1).values
 
-        # ---- EXACT global top-k over the non-forced tokens. Total
-        # retained = sum(forced) + remaining <= total_budget always. -------
-        flat = torch.cat(
-            [
-                d.to(device).masked_fill(forced_masks[l].to(device), float("-inf"))
-                for l, d in enumerate(damages)
-            ]
-        )
-        global_keep = torch.zeros(flat.numel(), dtype=torch.bool, device=device)
-        if remaining > 0:
-            global_keep[torch.topk(flat, remaining).indices] = True
-
+        floor = self.start_size + self.protect_size + self.min_keep_per_layer
         self.ratios = np.zeros(self.layer_num, dtype=np.float64)
-        self._prefill_kept = np.zeros(self.layer_num, dtype=np.int64)
 
         # ---- Per-layer triage: keep / merge / evict ----------------------
         self._reset_decode_state()
         out = []
-        offset = 0
         for l in range(self.layer_num):
             dmg = damages[l]
             N = seq_lens[l]
-            kept_mask = forced_masks[l] | global_keep[offset : offset + N].to(dmg.device)
-            offset += N
+            kept_mask = dmg >= tau
+            n_keep = int(kept_mask.sum().item())
+            if n_keep < floor:
+                top = torch.topk(dmg, floor).indices
+                kept_mask = torch.zeros_like(kept_mask)
+                kept_mask[top] = True
+                n_keep = floor
+
+            # Vision-representative floor: guarantee a few vision KVs per
+            # layer so (a) merge targets exist even under extreme budgets
+            # and (b) no layer ever goes fully vision-blind.
+            n_vis = text_start - image_start
+            if n_vis > 0 and self.min_vision_keep > 0:
+                vis_kept = int(kept_mask[image_start:text_start].sum().item())
+                need = min(self.min_vision_keep, n_vis) - vis_kept
+                if need > 0:
+                    vis_dmg = dmg[image_start:text_start].clone()
+                    vis_dmg[kept_mask[image_start:text_start]] = float("-inf")
+                    add = torch.topk(vis_dmg, need).indices + image_start
+                    kept_mask[add] = True
 
             # NRM: below-threshold vision tokens choose merge vs evict.
             cand_abs = ((~kept_mask).nonzero(as_tuple=True)[0])
@@ -489,17 +363,15 @@ class TGVKVCache:
             out.append([k_sel.unsqueeze(0), v_sel.unsqueeze(0)])
 
             self.ratios[l] = kept_idx.numel() / float(N)
-            self._prefill_kept[l] = kept_idx.numel()
             self._register_layer_decode_state(dmg, kept_idx, weights, image_start, text_start, N)
-
-            n_keep = int(kept_idx.numel())
-            n_merge = int(merge_src.numel()) if merge_src is not None else 0
-            n_evict = N - n_keep - n_merge
-            #print(f"[TriKV][prefill] layer {l:02d}: keep={n_keep}  merge={n_merge} evict={n_evict}  (N={N})")
-
-
-
-        check = self._check_budget(out, "prefill")
+        
+        temp = 0
+        for i in out:
+            temp += i[0].shape[-2]
+        if temp > self.total_budget:
+            print(
+                f"[TriKV] Warning: total retained ({temp}) exceeds budget ({self.total_budget}). "
+            )
         return DynamicCache(out)
 
     # ------------------------------------------------------------------ #
@@ -563,12 +435,7 @@ class TGVKVCache:
             step_dmg, hm_v = self._step_damage(attentions[i], v)
             acc = acc * self.decode_decay + step_dmg.to(acc.device)
 
-            if self.fixed_budget and hasattr(self, "_prefill_kept"):
-                # Hard budget: the cache never grows past its prefill
-                # allocation, so sum over layers stays <= total_budget.
-                target = int(self._prefill_kept[i])
-            else:
-                target = int(round(num_of_token * self.ratios[i]))
+            target = int(round(num_of_token * self.ratios[i]))
             overflow = seq_len - max(target, self.start_size + self.protect_size)
 
             if overflow < self.decode_chunk:                        # LCT: wait
@@ -576,29 +443,18 @@ class TGVKVCache:
                 out.append([k, v])
                 continue
 
-            # Tiered eviction priority (hard budget): prefer normal tokens,
-            # then soft-protected (instruction text / vision floor), then the
-            # recent window. Only sinks and the current final token are
-            # absolutely untouchable.
-            structural = torch.zeros_like(protected)
-            structural[: self.start_size] = True
-            structural[seq_len - self.protect_size :] = True
-
-            prio = acc.clone()
-            prio = prio + protected.float() * 1e6          # tier B: soft-protected
+            evictable = ~protected
+            evictable[: self.start_size] = False
             if self.recent_window > 0:
-                recent = torch.zeros_like(protected)
-                recent[max(0, seq_len - self.recent_window):] = True
-                prio = prio + recent.float() * 1e12        # tier C: newest tokens
-            prio = prio.masked_fill(structural, float("inf"))
-
-            n_out = min(overflow, int((~structural).sum().item()))
+                evictable[max(0, seq_len - self.recent_window):] = False
+            n_out = min(overflow, int(evictable.sum().item()))
             if n_out <= 0:
                 self._acc[i], self._protected[i], self._mass[i] = acc, protected, mass
                 out.append([k, v])
                 continue
 
-            drop_idx = torch.topk(prio, n_out, largest=False).indices
+            masked = acc.masked_fill(~evictable, float("inf"))
+            drop_idx = torch.topk(masked, n_out, largest=False).indices
 
             keep = torch.ones(seq_len, dtype=torch.bool, device=acc.device)
             keep[drop_idx] = False
@@ -629,7 +485,12 @@ class TGVKVCache:
             self._protected[i] = protected[keep_idx]
             self._mass[i] = mass[keep_idx]
 
-        check = self._check_budget(out, "decode")
+
+        temp = 0
+        for i in out:
+            temp += i[0].shape[-2]
+        if temp > self.total_budget:
+            print(
+                f"[TriKV] Warning: total retained ({temp}) exceeds budget ({self.total_budget}). "
+            )
         return DynamicCache(out)
-
-

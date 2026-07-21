@@ -25,8 +25,10 @@ source /lustre/hdd/LAS/jannesar-lab/msamani/pythonenv_tgv_kv/bin/activate
 # export HF_HUB_OFFLINE=1                   # Uncomment to use cached models only
 
 export CUDA_VISIBLE_DEVICES=0,1             # SLURM assigns GPUs starting from 0
-export MODEL_TYPE=llava-7B
-export MAX_GENERATED_TOKENS=32
+export MODEL_TYPE=llava-ov-0.5B
+export VISION_ASPECT_RATIO=anyres_max_2
+export HF_HUB_OFFLINE=0
+export MAX_GENERATED_TOKENS=128
 export KV_CACHE_TYPE=tgv_kv
 export HF_TOKEN=""
 hf auth login --token $HF_TOKEN
@@ -56,11 +58,11 @@ for ratio in "${ratios[@]}"; do
     --main_process_port 29508 \
     -m lmms_eval \
     --model llava_hf \
-    --model_args "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda" \
-    --tasks "chartqa,textvqa_val,docvqa_val,vizwiz_vqa_val" \
+    --model_args "pretrained=llava-hf/llava-onevision-qwen2-0.5b-ov-hf,attn_implementation=eager,device_map=cuda" \
+    --tasks "pope,realworldqa" \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix reproduce \
-    --output_path ./logs_llava/
+    --output_path ./logs_llava_ov/
 
 done

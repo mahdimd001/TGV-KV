@@ -40,3 +40,4 @@ accelerate launch --num_processes=1 -m lmms_eval --model llava_hf \
     llava-hf/llava-1.5-7b-hf
 
 
+aaa

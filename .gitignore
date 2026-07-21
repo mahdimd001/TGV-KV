@@ -18,6 +18,7 @@ __pycache__/
 *.safetensors
 logs/
 models/
+logs_*/
 
 # HPC / Cluster Logs
 slurm-*.out

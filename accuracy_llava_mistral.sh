@@ -56,7 +56,7 @@ for ratio in "${ratios[@]}"; do
     --main_process_port 29508 \
     -m lmms_eval \
     --model llava_hf \
-    --model_args "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda" \
+    --model_args "pretrained=llava-hf/llava-v1.6-mistral-7b-hf,attn_implementation=eager,device_map=cuda" \
     --tasks "chartqa,textvqa_val,docvqa_val,vizwiz_vqa_val" \
     --batch_size 1 \
     --log_samples \

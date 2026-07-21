@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:a100:2
 #SBATCH --partition=nova
 #SBATCH --account=jannesar-lab
-#SBATCH --job-name="llava_tgv"
+#SBATCH --job-name="qwen4_tgv"
 #SBATCH --mail-user=msamani@iastate.edu
 #SBATCH --mail-type=BEGIN
 #SBATCH --mail-type=END
@@ -25,9 +25,11 @@ source /lustre/hdd/LAS/jannesar-lab/msamani/pythonenv_tgv_kv/bin/activate
 # export HF_HUB_OFFLINE=1                   # Uncomment to use cached models only
 
 export CUDA_VISIBLE_DEVICES=0,1             # SLURM assigns GPUs starting from 0
-export MODEL_TYPE=llava-7B
+export MODEL_TYPE=qwen-4B
 export MAX_GENERATED_TOKENS=32
+export IMAGE_MAX_TOKEN_NUM=1024
 export KV_CACHE_TYPE=tgv_kv
+
 export HF_TOKEN=""
 hf auth login --token $HF_TOKEN
 
@@ -36,6 +38,8 @@ export HF_HOME=/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface
 export HF_DATASETS_CACHE=/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/datasets
 export TRANSFORMERS_CACHE=/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/hub
 export HF_HUB_CACHE=/lustre/hdd/LAS/jannesar-lab/msamani/.cache/huggingface/hub
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
 
@@ -55,12 +59,12 @@ for ratio in "${ratios[@]}"; do
     --num_processes=2 \
     --main_process_port 29508 \
     -m lmms_eval \
-    --model llava_hf \
-    --model_args "pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager,device_map=cuda" \
+    --model qwen3_vl \
+    --model_args "pretrained=Qwen/Qwen3-VL-4B-Instruct,attn_implementation=eager,device_map=cuda" \
     --tasks "chartqa,textvqa_val,docvqa_val,vizwiz_vqa_val" \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix reproduce \
-    --output_path ./logs_llava/
+    --output_path ./logs_qwen/
 
 done

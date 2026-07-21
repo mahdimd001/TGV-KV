@@ -1,3 +1,45 @@
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Debug lmms_eval with Accelerate",
+//             "type": "python",
+//             "request": "launch",
+//             "module": "accelerate.commands.launch",
+//             "console": "integratedTerminal",
+//             "justMyCode": false,
+//             "env": {
+//                 "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+//                 "MODEL_TYPE": "llava-ov-0.5B",
+//                 "MAX_GENERATED_TOKENS": "128",
+//                 "VISION_ASPECT_RATIO": "anyres_max_2",
+//                 "HF_HUB_OFFLINE": "0",
+//                 //"IMAGE_MAX_TOKEN_NUM": "1024",
+//                 "KV_CACHE_TYPE": "tgv_kv",
+//                 "PRUNE_RATIO": "0.9"
+//             },
+//             "args": [
+//                 "--num_processes=4",
+//                 "-m",
+//                 "lmms_eval",
+//                 "--model",
+//                 "llava_hf",
+//                 "--model_args",
+//                 "pretrained=llava-hf/llava-onevision-qwen2-0.5b-ov-hf,attn_implementation=eager,device_map=cuda",
+//                 "--tasks",
+//                 "pope",
+//                 "--batch_size",
+//                 "1",
+//                 "--log_samples",
+//                 "--output_path",
+//                 "./logs/",
+//                 "--limit",
+//                 "100"
+//             ]
+//         }
+//     ]
+// }
+
 {
     "version": "0.2.0",
     "configurations": [
@@ -10,19 +52,19 @@
             "justMyCode": false,
             "env": {
                 "CUDA_VISIBLE_DEVICES": "0,1,2,3",
-                "MODEL_TYPE": "qwen-4B",
+                "MODEL_TYPE": "phi3v",
                 "MAX_GENERATED_TOKENS": "32",
                 "KV_CACHE_TYPE": "tgv_kv",
-                "PRUNE_RATIO": "0.95"
+                "PRUNE_RATIO": "0.9"
             },
             "args": [
                 "--num_processes=4",
                 "-m",
                 "lmms_eval",
                 "--model",
-                "qwen3_vl",
+                "phi3v",
                 "--model_args",
-                "pretrained=Qwen/Qwen3-VL-4B-Instruct,attn_implementation=eager,device_map=cuda",
+                "model_id_name=microsoft/Phi-3.5-vision-instruct,attn_implementation=eager,device_map=cuda",
                 "--tasks",
                 "chartqa",
                 "--batch_size",
@@ -30,8 +72,8 @@
                 "--log_samples",
                 "--output_path",
                 "./logs/",
-                // "--limit",
-                // "50"
+                "--limit",
+                "100"
             ]
         }
     ]
